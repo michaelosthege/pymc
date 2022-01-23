@@ -38,6 +38,8 @@ from typing import (
 
 import aesara.gradient as tg
 import cloudpickle
+import hagelkorn
+import mcbackend
 import numpy as np
 import xarray
 
@@ -234,7 +236,18 @@ def assign_step_methods(model, step=None, methods=STEP_METHODS, step_kwargs=None
     return instantiate_steppers(model, steps, selected_steps, step_kwargs)
 
 
-def _print_step_hierarchy(s: Step, level: int = 0) -> None:
+def flatten_steps(step: Step) -> List[BlockedStep]:
+    if isinstance(step, BlockedStep):
+        return [step]
+    steps = []
+    if not isinstance(step, CompoundStep):
+        raise ValueError("Unexpected type of step method: {step}")
+    for sm in step.methods:
+        steps += flatten_steps(sm)
+    return steps
+
+
+def _print_step_hierarchy(s: Step, level=0) -> None:
     if isinstance(s, CompoundStep):
         _log.info(">" * level + "CompoundStep")
         for i in s.methods:
@@ -266,6 +279,85 @@ def all_continuous(vars, model):
         return False
     else:
         return True
+
+
+def _make_runmeta(
+    *,
+    var_dtypes: Dict[str, np.dtype],
+    var_shapes: Dict[str, Sequence[int]],
+    varnames: Sequence[str],
+    step: Step,
+    model,
+) -> mcbackend.RunMeta:
+    """Create an McBackend metadata description for the MCMC run.
+
+    Parameters
+    ----------
+    var_dtypes : dict
+        Variable names and corresponding NumPy dtypes.
+    var_shapes : dict
+        Variable names and corresponding shape tuples.
+    varnames : array-like
+        Names of variables that will be captured.
+    step : CompoundStep or BlockedStep
+        The step method that iterates the MCMC.
+    model : pm.Model
+        The current PyMC model.
+
+    Returns
+    -------
+    rmeta : mcbackend.RunMeta
+        Metadata about the model and MCMC sampling run.
+    """
+    # Replace None with "" in RV dims.
+    rv_dims = {name: ((dname or "") for dname in dims) for name, dims in model.RV_dims.items()}
+    free_rv_names = [rv.name for rv in model.free_RVs]
+    variables = [
+        mcbackend.Variable(
+            name,
+            str(var_dtypes[name]),
+            list(var_shapes[name]),
+            dims=list(rv_dims[name]) if name in rv_dims else None,
+            is_deterministic=(name not in free_rv_names),
+        )
+        for name in varnames
+    ]
+
+    _stat_groups = []
+    sample_stats = [
+        mcbackend.Variable("tune", "bool"),
+    ]
+
+    # In PyMC the sampler stats are grouped by the sampler.
+    # ⚠ PyMC currently does not inform backends about shapes/dims of sampler stats.
+    steps = flatten_steps(step)
+    for s, sm in enumerate(steps):
+        _stat_groups.append([])
+        for statstypes in sm.stats_dtypes:
+            for statname, dtype in statstypes.items():
+                sname = f"sampler_{s}__{statname}"
+                svar = mcbackend.Variable(
+                    name=sname,
+                    dtype=np.dtype(dtype).name,
+                    # This 👇 is needed until PyMC provides shapes ahead of time.
+                    undefined_ndim=True,
+                )
+                _stat_groups[s].append((sname, statname))
+                sample_stats.append(svar)
+
+    coordinates = [
+        mcbackend.Coordinate(dname, mcbackend.npproto.utils.ndarray_from_numpy(np.array(cvals)))
+        for dname, cvals in model.coords.items()
+        if cvals is not None
+    ]
+    meta = mcbackend.RunMeta(
+        rid=hagelkorn.random(),
+        variables=variables,
+        coordinates=coordinates,
+        sample_stats=sample_stats,
+        data=mcbackend.adapters.pymc.find_data(model),
+    )
+    return meta
 
 
 def sample(
@@ -528,9 +620,23 @@ def sample(
         initial_points = [ipfn(seed) for ipfn, seed in zip(ipfns, random_seed)]
 
     # One final check that shapes and logps at the starting points are okay.
+    ip = None
     for ip in initial_points:
         model.check_start_vals(ip)
         _check_start_shape(model, ip)
+
+    # Initialize a mcbackend.Run for storing draws.
+    backend = mcbackend.NumPyBackend()
+    run = backend.init_run(
+        _make_runmeta(
+            var_dtypes={vn: v.dtype for vn, v in ip.items()},
+            var_shapes={vn: v.shape for vn, v in ip.items()},
+            varnames=tuple(ip.keys()),
+            step=step,
+            model=model,
+        )
+    )
+    print("Successfully created RunMeta! 🥳")
 
     sample_args = {
         "draws": draws,
